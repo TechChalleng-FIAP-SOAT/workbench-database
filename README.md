@@ -25,16 +25,29 @@ central. A distribuição de bancos é:
 | Customer Service | PostgreSQL | Flyway no `workbench-customer-service` |
 | Execution Service | **MongoDB** (NoSQL) | no `workbench-execution-service` |
 
-Portanto, este repositório **provisiona a instância RDS PostgreSQL** que hospeda os
-bancos dos serviços **SQL** (OS, Billing, Customer) — cada um em seu **database
-lógico isolado** dentro da instância, com credenciais próprias. O **isolamento**
-exigido pelo PDF é garantido porque cada serviço só conhece a URL/credencial do seu
-próprio database; ninguém lê as tabelas do outro. O **MongoDB** do Execution é
-provisionado à parte (serviço gerenciado / container), fora deste repo.
+Portanto, este repositório **provisiona uma instância RDS PostgreSQL dedicada para
+cada serviço SQL** (OS, Billing, Customer). Cada instância tem **banco, credencial
+master, endpoint e security group próprios** — nada é compartilhado entre serviços.
+O isolamento é **físico**: uma instância não alcança os dados da outra por construção,
+atendendo literalmente o requisito do PDF ("cada microsserviço com banco de dados
+próprio" e "nenhum serviço pode acessar diretamente o banco de outro"). O **MongoDB**
+do Execution é provisionado à parte (serviço gerenciado / container), fora deste repo.
 
-> Alternativa possível (não adotada por custo no Learner Lab): uma instância RDS
-> por serviço. Optou-se por **uma instância compartilhada com databases lógicos
-> isolados**, que cumpre o isolamento lógico exigido pelo PDF a um custo viável.
+| Serviço | Instância RDS (`main`) | Database | Credencial |
+|---|---|---|---|
+| OS Service | `workshop-os-service-main` | `os_service` | própria |
+| Billing Service | `workshop-billing-main` | `billing` | própria |
+| Customer Service | `workshop-customer-main` | `customer` | própria |
+
+> Cada instância é criada pelo módulo `modules/rds-instance`, instanciado uma vez por
+> serviço via `for_each` sobre a variável `services`. Os nomes dos databases casam com
+> o `SPRING_DATASOURCE_URL` de cada serviço (ex.: `jdbc:postgresql://<endpoint-os>:5432/os_service`).
+> As senhas vêm da variável sensível `service_passwords` (injetada por secret no CI;
+> nunca commitada).
+
+> **Custo:** três instâncias `db.t3.micro` elegíveis ao free tier. Antes optou-se por
+> uma única instância com databases lógicos; a versão atual usa **uma instância por
+> serviço** para cumprir o requisito do PDF de forma literal (banco próprio por serviço).
 
 ### ⚠️ Sobre o schema histórico (`scripts/ddl.sql`)
 
@@ -47,9 +60,9 @@ por Flyway. O diagrama ER ao final deste documento descreve esse schema históri
 
 ## Tecnologias
 
-- **PostgreSQL 16** (Amazon RDS, `db.t3.micro`)
-- **Terraform** (`~> 5.0` AWS provider) — RDS, security group e subnet group
-- **GitHub Actions** — CI (`terraform fmt`/`validate`) e CD (deploy do RDS)
+- **PostgreSQL 16** (Amazon RDS, `db.t3.micro`) — **uma instância por serviço**
+- **Terraform** (`~> 5.0` AWS provider) — módulo `rds-instance` (RDS + security group + subnet group), instanciado por serviço
+- **GitHub Actions** — CI (`terraform fmt`/`validate`) e CD (deploy das instâncias)
 - Backend de estado remoto: **S3**
 
 ## Arquitetura deste repositório
@@ -57,23 +70,32 @@ por Flyway. O diagrama ER ao final deste documento descreve esse schema históri
 ```mermaid
 flowchart TB
     subgraph net["Rede (workbench-k8s-terraform via remote_state)"]
-        SG["Security Group RDS<br/>ingress 5432 ← node SG do EKS"]
+        NODESG["node SG do EKS"]
     end
-    subgraph rds["Amazon RDS PostgreSQL 16 (db.t3.micro)"]
-        DBOS[("database: os_service")]
-        DBBILL[("database: billing")]
-        DBCUST[("database: customer")]
+    subgraph aws["Amazon RDS PostgreSQL 16 — uma instância por serviço"]
+        RDSOS[("workshop-os-service-main<br/>db: os_service<br/>SG próprio")]
+        RDSBILL[("workshop-billing-main<br/>db: billing<br/>SG próprio")]
+        RDSCUST[("workshop-customer-main<br/>db: customer<br/>SG próprio")]
     end
-    SG --> rds
-    OS["OS Service"] -->|JDBC só ao seu db| DBOS
-    BILL["Billing Service"] -->|JDBC só ao seu db| DBBILL
-    CUST["Customer Service"] -->|JDBC só ao seu db| DBCUST
+    NODESG -->|5432| RDSOS
+    NODESG -->|5432| RDSBILL
+    NODESG -->|5432| RDSCUST
+    OS["OS Service"] -->|JDBC| RDSOS
+    BILL["Billing Service"] -->|JDBC| RDSBILL
+    CUST["Customer Service"] -->|JDBC| RDSCUST
 ```
 
-O RDS **não é acessível publicamente** — o Security Group libera a porta 5432 apenas
-para o `node_security_group_id` do EKS (lido via `terraform_remote_state` do
+Cada instância **não é acessível publicamente** (`publicly_accessible = false`,
+default) — o Security Group de cada uma libera a porta 5432 apenas para o
+`node_security_group_id` do EKS (lido via `terraform_remote_state` do
 `workbench-k8s-terraform`), de modo que só os pods dos serviços (na mesma VPC)
-alcancem o banco.
+alcancem o banco. CIDRs adicionais podem ser liberados via `allowed_cidr_blocks`
+(vazio por padrão). Não há regra `0.0.0.0/0`.
+
+A rede (VPC, subnets privadas e node SG) é resolvida do estado remoto do
+`workbench-k8s-terraform` quando `k8s_remote_state_bucket` é informado; caso contrário,
+cai nos valores passados em `vpc_id`/`subnet_ids` (compatível com o CI atual, que os
+injeta por secret).
 
 ---
 
@@ -91,24 +113,33 @@ O requisito **NoSQL** do PDF é atendido pelo MongoDB do Execution Service.
 
 ```bash
 cd infra/terraform
-cp terraform.tfvars.example terraform.tfvars   # preencha os valores reais
+cp terraform.tfvars.example terraform.tfvars   # preencha services + service_passwords
 
 terraform init \
   -backend-config="bucket=<state-bucket>" \
-  -backend-config="key=database/<env>/terraform.tfstate" \
+  -backend-config="key=workbench-database/<env>/terraform.tfstate" \
   -backend-config="region=us-east-1"
 
-terraform apply   # provisiona o RDS e cria o database informado em var.db_name
+terraform apply   # provisiona UMA instância RDS por serviço
 ```
 
-Após o `apply`, o output `aurora_jdbc_url` é a base da URL JDBC; cada serviço recebe,
-no seu secret `DB_URL_<ENV>`, a URL apontando para o **seu** database lógico.
+Após o `apply`, o output `service_jdbc_urls` (sensível) traz um mapa
+`serviço -> URL JDBC`, cada um apontando para a **sua instância dedicada**; é a base
+do secret `DB_URL_<ENV>` de cada microsserviço. Veja também `instance_endpoints`,
+`instance_identifiers` e `service_databases`.
+
+```bash
+terraform output -json service_jdbc_urls   # { "os_service": "...", "billing": "...", "customer": "..." }
+```
 
 ### Credenciais
 
-Secrets `DB_USERNAME` e `DB_PASSWORD` no GitHub Actions. O usuário não pode ser
-`postgres` (reservado pelo RDS) — use, por exemplo, `dbadmin`. Cada serviço deve ter
-seu usuário/credencial próprios para reforçar o isolamento.
+Cada instância tem **usuário e senha próprios**, definidos em `services[*].db_username`
+e `service_passwords[*]`. O usuário não pode ser `postgres`/`admin`/`root`/`rdsadmin`
+(reservados pelo RDS). No CI, as senhas vêm dos secrets `DB_PASSWORD_OS`,
+`DB_PASSWORD_BILLING` e `DB_PASSWORD_CUSTOMER` (e, opcionalmente, `DB_USERNAME_*`); são
+injetadas via `TF_VAR_service_passwords` e nunca gravadas em arquivo. Como são
+instâncias separadas, a credencial de um serviço **não dá acesso** ao banco de outro.
 
 ## Ordem de deploy (infra)
 
