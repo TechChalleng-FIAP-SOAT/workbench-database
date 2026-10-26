@@ -26,6 +26,14 @@ variable "db_username" {
     ], lower(var.db_username))
     error_message = "db_username usa um nome reservado pelo PostgreSQL RDS. Use, por exemplo, dbadmin."
   }
+
+  # Regra do RDS PostgreSQL: 1 a 63 caracteres, começa com letra, só letras,
+  # números e underscore. Fora disso o CreateDBInstance falha com
+  # "Invalid master user name" — melhor barrar já no plan.
+  validation {
+    condition     = can(regex("^[A-Za-z][A-Za-z0-9_]{0,62}$", var.db_username))
+    error_message = "db_username inválido para RDS PostgreSQL: use 1 a 63 caracteres, começando com letra, apenas letras, números e underscore (sem hífen, espaço ou caractere especial). Ex.: os_service."
+  }
 }
 
 variable "db_password" {
