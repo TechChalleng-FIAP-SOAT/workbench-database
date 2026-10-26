@@ -178,15 +178,13 @@ jobs:
             fi
           done
 
-      - name: Terraform Plan (save tfplan)
-        run: terraform plan -input=false -no-color -out=tfplan
-
-      - name: Upload plan artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: infra/terraform/tfplan
+      # Plano (apenas para visibilidade nos logs). NÃO salvamos o plano em arquivo:
+      # o apply recebe as mesmas variáveis por TF_VAR_* e aplicar um plano salvo
+      # proíbe re-setar variáveis (erro "Can't change variable when applying a
+      # saved plan"). Por isso o apply roda direto, resolvendo as variáveis de novo.
+      - name: Terraform Plan (log)
+        run: terraform plan -input=false -no-color
 
       - name: Terraform Apply
         shell: bash
-        run: terraform apply -input=false -auto-approve tfplan
+        run: terraform apply -input=false -auto-approve
