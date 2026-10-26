@@ -52,5 +52,7 @@ module "service_db" {
   allocated_storage   = each.value.allocated_storage
   publicly_accessible = var.publicly_accessible
 
+  backup_retention_period = var.backup_retention_period
+
   tags = local.common_tags
 }
