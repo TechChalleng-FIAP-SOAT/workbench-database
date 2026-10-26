@@ -1,0 +1,51 @@
+# Copie para terraform.tfvars e preencha com valores reais.
+# NUNCA commite o terraform.tfvars (já está no .gitignore).
+
+region         = "us-east-1"
+environment    = "develop"
+name_prefix    = "workshop"
+aws_account_id = "" # opcional; vazio = sem guardrail de conta (validação local)
+
+# --- Rede -------------------------------------------------------------------
+# Opção A (recomendada): deixe vpc_id/subnet_ids vazios e aponte o bucket do
+# estado do workbench-k8s-terraform; vpc, subnets privadas e o node SG do EKS
+# são resolvidos automaticamente e aplicados a TODAS as instâncias.
+k8s_remote_state_bucket = "meu-bucket-tfstate"
+vpc_id                  = ""
+subnet_ids              = []
+
+# Opção B: informe a rede manualmente (deixe k8s_remote_state_bucket = "").
+# vpc_id     = "vpc-xxxxxxxx"
+# subnet_ids = ["subnet-aaaa", "subnet-bbbb"]
+
+# Mantenha as instâncias privadas. Só habilite público em cenários de teste.
+publicly_accessible = false
+# CIDRs extras na 5432 (ex.: runner de migração). Vazio = só EKS.
+allowed_cidr_blocks = []
+
+# --- Uma instância RDS dedicada por serviço (banco próprio por serviço) ------
+# Cada chave vira uma instância RDS. db_name/db_username são da instância
+# daquele serviço; a senha vai em service_passwords (mantida separada por ser
+# sensível). Os db_name casam com o SPRING_DATASOURCE_URL de cada serviço.
+services = {
+  os_service = {
+    db_name     = "os_service"
+    db_username = "os_service" # não pode ser postgres/admin/root/rdsadmin
+  }
+  billing = {
+    db_name     = "billing"
+    db_username = "billing"
+  }
+  customer = {
+    db_name     = "customer"
+    db_username = "customer"
+  }
+}
+
+# Senha master de cada instância. Chaves devem casar com services.
+# No CI, injete via TF_VAR_service_passwords (secret) em vez de arquivo.
+service_passwords = {
+  os_service = "troque-os"
+  billing    = "troque-billing"
+  customer   = "troque-customer"
+}

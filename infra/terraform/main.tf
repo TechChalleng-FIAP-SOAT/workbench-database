@@ -1,150 +1,56 @@
 ############################################
-# DB Subnet Group
+# Rede resolvida (estado remoto do k8s OU variáveis)
 ############################################
 
-resource "aws_db_subnet_group" "aurora_subnets" {
-  name       = "aurora-${var.db_name}-subnet-group"
-  subnet_ids = var.subnet_ids
+locals {
+  k8s = length(data.terraform_remote_state.k8s) > 0 ? data.terraform_remote_state.k8s[0].outputs : null
 
-  tags = {
-    Name = "Aurora Subnet Group"
+  vpc_id = var.vpc_id != "" ? var.vpc_id : (local.k8s != null ? local.k8s.vpc_id : null)
+
+  subnet_ids = length(var.subnet_ids) > 0 ? var.subnet_ids : (local.k8s != null ? local.k8s.private_subnet_ids : [])
+
+  # Node SG do EKS: só existe quando lemos o estado remoto. Quando ausente,
+  # o acesso depende exclusivamente de allowed_cidr_blocks.
+  node_security_group_id = local.k8s != null ? local.k8s.node_security_group_id : null
+
+  common_tags = {
+    Project     = "workbench"
+    Component   = "database"
+    ManagedBy   = "Terraform"
+    Environment = var.environment
   }
 }
 
 ############################################
-# Security Group
+# Uma instância RDS PostgreSQL por serviço (database-per-service, ADR Fase 4).
+#
+# Cada serviço (os_service, billing, customer) recebe uma INSTÂNCIA própria,
+# com banco, credencial, endpoint e security group dedicados. O isolamento é
+# físico: nenhuma instância alcança os dados da outra — atende literalmente o
+# requisito do PDF ("cada microsserviço com banco próprio" / "nenhum serviço
+# acessa o banco de outro"). O Execution Service usa MongoDB, fora deste repo.
 ############################################
 
-resource "aws_security_group" "aurora_sg" {
-  name        = "aurora-${var.db_name}-security-group"
-  description = "Acesso ao Aurora PostgreSQL"
-  vpc_id      = var.vpc_id
+module "service_db" {
+  source   = "./modules/rds-instance"
+  for_each = var.services
 
-  ingress {
-    from_port   = 5432
-    to_port     = 5432
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # ajuste conforme sua rede
-  }
+  service = each.key
+  # Identificador RDS não aceita underscore -> troca por hífen (os_service -> os-service).
+  # O db_name permanece com underscore (os_service), casando com o SPRING_DATASOURCE_URL.
+  identifier  = "${var.name_prefix}-${replace(each.key, "_", "-")}-${var.environment}"
+  db_name     = each.value.db_name
+  db_username = each.value.db_username
+  db_password = var.service_passwords[each.key]
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+  vpc_id                 = local.vpc_id
+  subnet_ids             = local.subnet_ids
+  node_security_group_id = local.node_security_group_id
+  allowed_cidr_blocks    = var.allowed_cidr_blocks
+
+  instance_class      = each.value.instance_class
+  allocated_storage   = each.value.allocated_storage
+  publicly_accessible = var.publicly_accessible
+
+  tags = local.common_tags
 }
-
-############################################
-# Instancia PostgreSQL RDS para o Free Tier
-############################################
-
-resource "aws_db_instance" "postgres" {
-  identifier = var.db_name
-
-  engine         = "postgres"
-  instance_class = "db.t3.micro"
-
-  allocated_storage = 20
-  storage_type      = "gp3"
-
-  username = var.db_username
-  password = var.db_password
-  port     = 5432
-
-  db_subnet_group_name   = aws_db_subnet_group.aurora_subnets.name
-  vpc_security_group_ids = [aws_security_group.aurora_sg.id]
-
-  publicly_accessible     = true
-  backup_retention_period = 0
-  skip_final_snapshot     = true
-  deletion_protection     = false
-  apply_immediately       = true
-}
-
-############################################
-# PostgreSQL DDL
-############################################
-
-resource "null_resource" "create_database" {
-  triggers = {
-    db_name = var.db_name
-  }
-
-  depends_on = [aws_db_instance.postgres]
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      set -e
-      EXISTS=$(PGPASSWORD="${var.db_password}" psql \
-        -v ON_ERROR_STOP=1 \
-        -h "${aws_db_instance.postgres.address}" \
-        -U "${var.db_username}" \
-        -d postgres \
-        -tAc "SELECT 1 FROM pg_database WHERE datname='${var.db_name}'")
-
-      if [ "$EXISTS" != "1" ]; then
-        PGPASSWORD="${var.db_password}" psql \
-          -v ON_ERROR_STOP=1 \
-          -h "${aws_db_instance.postgres.address}" \
-          -U "${var.db_username}" \
-          -d postgres \
-          -c "CREATE DATABASE \"${var.db_name}\""
-      fi
-    EOT
-    interpreter = ["/bin/bash", "-c"]
-  }
-}
-
-resource "null_resource" "run_ddl" {
-  count = var.run_migrations ? 1 : 0
-
-  triggers = {
-    script_hash = filesha256("${path.module}/../../scripts/ddl.sql")
-  }
-
-  depends_on = [null_resource.create_database]
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      PGPASSWORD="${var.db_password}" psql \
-        -v ON_ERROR_STOP=1 \
-        -h "${aws_db_instance.postgres.address}" \
-        -U "${var.db_username}" \
-        -d "${var.db_name}" \
-        -f "${path.module}/../../scripts/ddl.sql"
-    EOT
-    interpreter = ["/bin/bash", "-c"]
-  }
-}
-
-
-############################################
-# PostgreSQL DML
-############################################
-
-resource "null_resource" "run_dml" {
-  count = var.run_migrations ? 1 : 0
-
-  triggers = {
-    script_hash = filesha256("${path.module}/../../scripts/dml.sql")
-  }
-
-  depends_on = [
-    null_resource.run_ddl
-  ]
-
-  provisioner "local-exec" {
-    command = <<-EOT
-      set -e
-      PGPASSWORD="${var.db_password}" psql \
-        -v ON_ERROR_STOP=1 \
-        -h "${aws_db_instance.postgres.address}" \
-        -U "${var.db_username}" \
-        -d "${var.db_name}" \
-        -f "${path.module}/../../scripts/dml.sql"
-    EOT
-    interpreter = ["/bin/bash", "-c"]
-  }
-}
-

@@ -1,4 +1,4 @@
-name: "Terraform Aurora Deployment"
+name: "Terraform RDS (one instance per service) Deployment"
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
   id-token: write
-  
+
 jobs:
 
   preflight:
@@ -41,11 +41,15 @@ jobs:
 
       - name: Terraform validate (placeholders)
         run: |
-          cat > ci-placeholder.auto.tfvars <<EOF
-          vpc_id = "placeholder"
+          cat > ci-placeholder.auto.tfvars <<'EOF'
+          vpc_id     = "placeholder"
           subnet_ids = ["subnet-1","subnet-2"]
-          db_username = "dbadmin"
-          db_password = "placeholder"
+          services = {
+            os_service = { db_name = "os_service", db_username = "os_service" }
+            billing    = { db_name = "billing",    db_username = "billing" }
+            customer   = { db_name = "customer",   db_username = "customer" }
+          }
+          service_passwords = { os_service = "placeholder", billing = "placeholder", customer = "placeholder" }
           EOF
           terraform validate
 
@@ -59,12 +63,20 @@ jobs:
         working-directory: infra/terraform
     if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
     env:
+      # Rede: resolvida do estado remoto do k8s (recomendado). Os secrets de VPC/subnet
+      # continuam aceitos como fallback quando TF_VAR_k8s_remote_state_bucket é vazio.
+      TF_VAR_k8s_remote_state_bucket: ${{ github.ref_name == 'main' && secrets.TF_STATE_BUCKET_MAIN || secrets.TF_STATE_BUCKET_DEVELOP }}
       TF_VAR_vpc_id: ${{ github.ref_name == 'main' && secrets.VPC_ID_MAIN || secrets.VPC_ID_DEVELOP }}
-      TF_VAR_subnet_ids: ${{ github.ref_name == 'main' && secrets.SUBNET_IDS_MAIN || secrets.SUBNET_IDS_DEVELOP }} # deve ser '["subnet-1","subnet-2"]'
-      TF_VAR_db_username: ${{ secrets.DB_USERNAME }}
-      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
-      TF_VAR_db_name: workshop-${{ github.ref_name }}
-      # Org-level values, MAIN/DEVELOP-suffixed, selected by branch (main->MAIN, develop->DEVELOP).
+      TF_VAR_subnet_ids: ${{ github.ref_name == 'main' && secrets.SUBNET_IDS_MAIN || secrets.SUBNET_IDS_DEVELOP }} # '["subnet-1","subnet-2"]'
+      TF_VAR_environment: ${{ github.ref_name }}
+      TF_VAR_name_prefix: workshop
+      # Usuário master por serviço (default = nome do serviço). Senhas vêm de secrets.
+      DB_USERNAME_OS: ${{ secrets.DB_USERNAME_OS || 'os_service' }}
+      DB_USERNAME_BILLING: ${{ secrets.DB_USERNAME_BILLING || 'billing' }}
+      DB_USERNAME_CUSTOMER: ${{ secrets.DB_USERNAME_CUSTOMER || 'customer' }}
+      DB_PASSWORD_OS: ${{ secrets.DB_PASSWORD_OS }}
+      DB_PASSWORD_BILLING: ${{ secrets.DB_PASSWORD_BILLING }}
+      DB_PASSWORD_CUSTOMER: ${{ secrets.DB_PASSWORD_CUSTOMER }}
       TF_VAR_aws_account_id: ${{ github.ref_name == 'main' && secrets.AWS_ACCOUNT_ID_MAIN || secrets.AWS_ACCOUNT_ID_DEVELOP }}
       TF_STATE_BUCKET: ${{ github.ref_name == 'main' && secrets.TF_STATE_BUCKET_MAIN || secrets.TF_STATE_BUCKET_DEVELOP }}
       AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
@@ -78,12 +90,38 @@ jobs:
           aws-access-key-id: ${{ github.ref_name == 'main' && secrets.AWS_ACCESS_KEY_ID_MAIN || secrets.AWS_ACCESS_KEY_ID_DEVELOP }}
           aws-secret-access-key: ${{ github.ref_name == 'main' && secrets.AWS_SECRET_ACCESS_KEY_MAIN || secrets.AWS_SECRET_ACCESS_KEY_DEVELOP }}
           aws-region: ${{ env.AWS_REGION }}
-      # ou substitua a step acima por OIDC: role-to-assume + id-token: write nas permissions
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.10.0"
+
+      - name: Build per-service tfvars (services + passwords)
+        shell: bash
+        run: |
+          # Valida presença das senhas.
+          for v in DB_PASSWORD_OS DB_PASSWORD_BILLING DB_PASSWORD_CUSTOMER; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Segredo $v ausente."; exit 1
+            fi
+            if [ "${#DB_PASSWORD_OS}" -lt 8 ]; then :; fi
+          done
+
+          # services (sem senha) — arquivo versionável em runtime, não sensível.
+          cat > services.auto.tfvars.json <<JSON
+          {
+            "services": {
+              "os_service": { "db_name": "os_service", "db_username": "${DB_USERNAME_OS}" },
+              "billing":    { "db_name": "billing",    "db_username": "${DB_USERNAME_BILLING}" },
+              "customer":   { "db_name": "customer",   "db_username": "${DB_USERNAME_CUSTOMER}" }
+            }
+          }
+          JSON
+
+          # senhas por serviço via TF_VAR (não gravadas em arquivo).
+          {
+            echo "TF_VAR_service_passwords={\"os_service\":\"${DB_PASSWORD_OS}\",\"billing\":\"${DB_PASSWORD_BILLING}\",\"customer\":\"${DB_PASSWORD_CUSTOMER}\"}"
+          } >> "$GITHUB_ENV"
 
       - name: Terraform Init
         shell: bash
@@ -107,40 +145,41 @@ jobs:
           import_if_missing() {
             local address="$1"
             local resource_id="$2"
-
             if ! terraform state show "$address" >/dev/null 2>&1; then
-              terraform import -input=false "$address" "$resource_id"
+              terraform import -input=false "$address" "$resource_id" || true
             fi
           }
 
-          subnet_group_name="aurora-${TF_VAR_db_name}-subnet-group"
-          subnet_group_exists=$(aws rds describe-db-subnet-groups \
-            --db-subnet-group-name "$subnet_group_name" \
-            --query 'DBSubnetGroups[0].DBSubnetGroupName' \
-            --output text 2>/dev/null || true)
-          if [ "$subnet_group_exists" != "None" ] && [ -n "$subnet_group_exists" ]; then
-            import_if_missing "aws_db_subnet_group.aurora_subnets" "$subnet_group_name"
-          fi
+          # Importa, por serviço, a instância/SG/subnet group já existentes (se houver).
+          for svc in os_service billing customer; do
+            id_svc="${svc//_/-}" # identifier usa hífen
+            identifier="workshop-${id_svc}-${{ github.ref_name }}"
 
-          security_group_id=$(aws ec2 describe-security-groups \
-            --filters "Name=vpc-id,Values=${TF_VAR_vpc_id}" "Name=group-name,Values=aurora-${TF_VAR_db_name}-security-group" \
-            --query 'SecurityGroups[0].GroupId' \
-            --output text 2>/dev/null || true)
-          if [ "$security_group_id" != "None" ] && [ -n "$security_group_id" ]; then
-            import_if_missing "aws_security_group.aurora_sg" "$security_group_id"
-          fi
+            instance_exists=$(aws rds describe-db-instances \
+              --db-instance-identifier "$identifier" \
+              --query 'DBInstances[0].DBInstanceIdentifier' --output text 2>/dev/null || true)
+            if [ "$instance_exists" != "None" ] && [ -n "$instance_exists" ]; then
+              import_if_missing "module.service_db[\"$svc\"].aws_db_instance.this" "$identifier"
+            fi
 
-          instance_exists=$(aws rds describe-db-instances \
-            --db-instance-identifier "${TF_VAR_db_name}" \
-            --query 'DBInstances[0].DBInstanceIdentifier' \
-            --output text 2>/dev/null || true)
-          if [ "$instance_exists" != "None" ] && [ -n "$instance_exists" ]; then
-            import_if_missing "aws_db_instance.postgres" "${TF_VAR_db_name}"
-          fi
+            sg_id=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=${identifier}-security-group" \
+              --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+            if [ "$sg_id" != "None" ] && [ -n "$sg_id" ]; then
+              import_if_missing "module.service_db[\"$svc\"].aws_security_group.this" "$sg_id"
+            fi
+
+            subnet_group="${identifier}-subnet-group"
+            sg_exists=$(aws rds describe-db-subnet-groups \
+              --db-subnet-group-name "$subnet_group" \
+              --query 'DBSubnetGroups[0].DBSubnetGroupName' --output text 2>/dev/null || true)
+            if [ "$sg_exists" != "None" ] && [ -n "$sg_exists" ]; then
+              import_if_missing "module.service_db[\"$svc\"].aws_db_subnet_group.this" "$subnet_group"
+            fi
+          done
 
       - name: Terraform Plan (save tfplan)
-        run: |
-          terraform plan -input=false -no-color -out=tfplan
+        run: terraform plan -input=false -no-color -out=tfplan
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
@@ -150,11 +189,4 @@ jobs:
 
       - name: Terraform Apply
         shell: bash
-        run: |
-          # O plano salvo já contém os valores das variáveis.
-          unset TF_VAR_vpc_id
-          unset TF_VAR_subnet_ids
-          unset TF_VAR_db_username
-          unset TF_VAR_db_password
-
-          terraform apply -input=false -auto-approve tfplan
+        run: terraform apply -input=false -auto-approve tfplan
