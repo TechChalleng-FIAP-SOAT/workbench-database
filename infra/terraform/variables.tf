@@ -49,6 +49,12 @@ variable "publicly_accessible" {
   default     = false
 }
 
+variable "backup_retention_period" {
+  description = "Dias de retenção de backup automático em TODAS as instâncias. Contas no plano Free da AWS aceitam no máximo 1 (acima disso o CreateDBInstance falha com FreeTierRestrictionError)."
+  type        = number
+  default     = 1
+}
+
 variable "allowed_cidr_blocks" {
   description = "CIDRs extras liberados na porta 5432 em TODAS as instâncias (ex.: runner de migração com acesso à VPC). Vazio = acesso só pelo node SG do EKS."
   type        = list(string)

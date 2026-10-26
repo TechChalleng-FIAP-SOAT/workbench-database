@@ -93,8 +93,9 @@ alcancem o banco. CIDRs adicionais podem ser liberados via `allowed_cidr_blocks`
 (vazio por padrão). Não há regra `0.0.0.0/0`.
 
 Cada instância tem **criptografia em repouso** (`storage_encrypted = true`, sem custo
-adicional) e **backups automáticos** (`backup_retention_period = 7` dias por padrão,
-ajustável de 1 a 35).
+adicional) e **backups automáticos** (`backup_retention_period = 1` dia por padrão,
+ajustável de 0 a 35). O padrão é 1 porque contas no plano Free da AWS rejeitam valores
+maiores (`FreeTierRestrictionError`); em conta paga, suba para 7 via variável.
 
 A rede (VPC, subnets privadas e node SG) é resolvida do estado remoto do
 `workbench-k8s-terraform` quando `k8s_remote_state_bucket` é informado; caso contrário,

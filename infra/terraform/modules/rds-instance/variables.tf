@@ -81,13 +81,13 @@ variable "storage_encrypted" {
 }
 
 variable "backup_retention_period" {
-  description = "Dias de retenção de backup automático. 0 desliga os backups (não recomendado)."
+  description = "Dias de retenção de backup automático. 0 desliga os backups. Contas no plano Free da AWS aceitam no máximo 1."
   type        = number
-  default     = 7
+  default     = 1
 
   validation {
-    condition     = var.backup_retention_period >= 1 && var.backup_retention_period <= 35
-    error_message = "backup_retention_period deve estar entre 1 e 35 dias."
+    condition     = var.backup_retention_period >= 0 && var.backup_retention_period <= 35
+    error_message = "backup_retention_period deve estar entre 0 e 35 dias."
   }
 }
 
