@@ -74,6 +74,23 @@ variable "publicly_accessible" {
   default     = false
 }
 
+variable "storage_encrypted" {
+  description = "Criptografia em repouso (KMS). Mantenha true; é sem custo adicional no RDS."
+  type        = bool
+  default     = true
+}
+
+variable "backup_retention_period" {
+  description = "Dias de retenção de backup automático. 0 desliga os backups (não recomendado)."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.backup_retention_period >= 1 && var.backup_retention_period <= 35
+    error_message = "backup_retention_period deve estar entre 1 e 35 dias."
+  }
+}
+
 variable "tags" {
   description = "Tags aplicadas aos recursos."
   type        = map(string)

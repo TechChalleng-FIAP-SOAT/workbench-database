@@ -88,11 +88,15 @@ resource "aws_db_instance" "this" {
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.this.id]
 
-  publicly_accessible     = var.publicly_accessible
-  backup_retention_period = 0
-  skip_final_snapshot     = true
-  deletion_protection     = false
-  apply_immediately       = true
+  publicly_accessible = var.publicly_accessible
+
+  # Criptografia em repouso (sem custo adicional) + backups automáticos.
+  storage_encrypted       = var.storage_encrypted
+  backup_retention_period = var.backup_retention_period
+
+  skip_final_snapshot = true
+  deletion_protection = false
+  apply_immediately   = true
 
   tags = merge(var.tags, {
     Name    = var.identifier

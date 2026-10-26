@@ -92,6 +92,10 @@ default) — o Security Group de cada uma libera a porta 5432 apenas para o
 alcancem o banco. CIDRs adicionais podem ser liberados via `allowed_cidr_blocks`
 (vazio por padrão). Não há regra `0.0.0.0/0`.
 
+Cada instância tem **criptografia em repouso** (`storage_encrypted = true`, sem custo
+adicional) e **backups automáticos** (`backup_retention_period = 7` dias por padrão,
+ajustável de 1 a 35).
+
 A rede (VPC, subnets privadas e node SG) é resolvida do estado remoto do
 `workbench-k8s-terraform` quando `k8s_remote_state_bucket` é informado; caso contrário,
 cai nos valores passados em `vpc_id`/`subnet_ids` (compatível com o CI atual, que os
