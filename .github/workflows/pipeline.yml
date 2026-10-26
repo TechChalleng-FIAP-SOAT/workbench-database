@@ -33,6 +33,7 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.10.0"
+          terraform_wrapper: false
 
       - name: Terraform fmt & init (no backend)
         run: |
@@ -63,24 +64,23 @@ jobs:
         working-directory: infra/terraform
     if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main')
     env:
-      # Rede: resolvida do estado remoto do k8s (recomendado). Os secrets de VPC/subnet
-      # continuam aceitos como fallback quando TF_VAR_k8s_remote_state_bucket é vazio.
-      TF_VAR_k8s_remote_state_bucket: ${{ github.ref_name == 'main' && secrets.TF_STATE_BUCKET_MAIN || secrets.TF_STATE_BUCKET_DEVELOP }}
-      TF_VAR_vpc_id: ${{ github.ref_name == 'main' && secrets.VPC_ID_MAIN || secrets.VPC_ID_DEVELOP }}
-      TF_VAR_subnet_ids: ${{ github.ref_name == 'main' && secrets.SUBNET_IDS_MAIN || secrets.SUBNET_IDS_DEVELOP }} # '["subnet-1","subnet-2"]'
-      TF_VAR_environment: ${{ github.ref_name }}
-      TF_VAR_name_prefix: workshop
-      # Usuário master por serviço (default = nome do serviço). Senhas vêm de secrets.
+      # Credenciais/ambiente do runner. As VARIÁVEIS do Terraform NÃO vão por TF_VAR_*
+      # — elas são escritas num arquivo deploy.auto.tfvars.json (passo "Build tfvars"),
+      # lido de forma idêntica por plan e apply. Isso evita o erro
+      # "Can't change variable when applying a saved plan".
+      TF_STATE_BUCKET: ${{ github.ref_name == 'main' && secrets.TF_STATE_BUCKET_MAIN || secrets.TF_STATE_BUCKET_DEVELOP }}
+      AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+      VPC_ID: ${{ github.ref_name == 'main' && secrets.VPC_ID_MAIN || secrets.VPC_ID_DEVELOP }}
+      SUBNET_IDS: ${{ github.ref_name == 'main' && secrets.SUBNET_IDS_MAIN || secrets.SUBNET_IDS_DEVELOP }} # '["subnet-1","subnet-2"]'
+      K8S_STATE_BUCKET: ${{ github.ref_name == 'main' && secrets.TF_STATE_BUCKET_MAIN || secrets.TF_STATE_BUCKET_DEVELOP }}
+      ENVIRONMENT: ${{ github.ref_name }}
+      AWS_ACCOUNT_ID: ${{ github.ref_name == 'main' && secrets.AWS_ACCOUNT_ID_MAIN || secrets.AWS_ACCOUNT_ID_DEVELOP }}
       DB_USERNAME_OS: ${{ secrets.DB_USERNAME_OS || 'os_service' }}
       DB_USERNAME_BILLING: ${{ secrets.DB_USERNAME_BILLING || 'billing' }}
       DB_USERNAME_CUSTOMER: ${{ secrets.DB_USERNAME_CUSTOMER || 'customer' }}
       DB_PASSWORD_OS: ${{ secrets.DB_PASSWORD_OS }}
       DB_PASSWORD_BILLING: ${{ secrets.DB_PASSWORD_BILLING }}
       DB_PASSWORD_CUSTOMER: ${{ secrets.DB_PASSWORD_CUSTOMER }}
-      TF_VAR_aws_account_id: ${{ github.ref_name == 'main' && secrets.AWS_ACCOUNT_ID_MAIN || secrets.AWS_ACCOUNT_ID_DEVELOP }}
-      TF_STATE_BUCKET: ${{ github.ref_name == 'main' && secrets.TF_STATE_BUCKET_MAIN || secrets.TF_STATE_BUCKET_DEVELOP }}
-      AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
-      TF_VAR_region: ${{ secrets.AWS_REGION || 'us-east-1' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -95,33 +95,43 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.10.0"
+          # Sem wrapper: evita que a action intercepte/re-execute o terraform.
+          terraform_wrapper: false
 
-      - name: Build per-service tfvars (services + passwords)
+      - name: Build tfvars (rede + serviços + senhas)
         shell: bash
         run: |
-          # Valida presença das senhas.
           for v in DB_PASSWORD_OS DB_PASSWORD_BILLING DB_PASSWORD_CUSTOMER; do
             if [ -z "${!v}" ]; then
               echo "::error::Segredo $v ausente."; exit 1
             fi
-            if [ "${#DB_PASSWORD_OS}" -lt 8 ]; then :; fi
           done
+          : "${SUBNET_IDS:?SUBNET_IDS ausente}"
 
-          # services (sem senha) — arquivo versionável em runtime, não sensível.
-          cat > services.auto.tfvars.json <<JSON
+          # TODAS as variáveis do Terraform num único arquivo auto-carregado, lido
+          # igualmente por plan e apply. Nada vai por TF_VAR_* (origem do erro).
+          cat > deploy.auto.tfvars.json <<JSON
           {
+            "environment": "${ENVIRONMENT}",
+            "name_prefix": "workshop",
+            "region": "${AWS_REGION}",
+            "aws_account_id": "${AWS_ACCOUNT_ID}",
+            "k8s_remote_state_bucket": "${K8S_STATE_BUCKET}",
+            "vpc_id": "${VPC_ID}",
+            "subnet_ids": ${SUBNET_IDS},
             "services": {
               "os_service": { "db_name": "os_service", "db_username": "${DB_USERNAME_OS}" },
               "billing":    { "db_name": "billing",    "db_username": "${DB_USERNAME_BILLING}" },
               "customer":   { "db_name": "customer",   "db_username": "${DB_USERNAME_CUSTOMER}" }
+            },
+            "service_passwords": {
+              "os_service": "${DB_PASSWORD_OS}",
+              "billing":    "${DB_PASSWORD_BILLING}",
+              "customer":   "${DB_PASSWORD_CUSTOMER}"
             }
           }
           JSON
-
-          # senhas por serviço via TF_VAR (não gravadas em arquivo).
-          {
-            echo "TF_VAR_service_passwords={\"os_service\":\"${DB_PASSWORD_OS}\",\"billing\":\"${DB_PASSWORD_BILLING}\",\"customer\":\"${DB_PASSWORD_CUSTOMER}\"}"
-          } >> "$GITHUB_ENV"
+          echo "deploy.auto.tfvars.json gerado (valores omitidos)."
 
       - name: Terraform Init
         shell: bash
@@ -178,10 +188,8 @@ jobs:
             fi
           done
 
-      # Plano (apenas para visibilidade nos logs). NÃO salvamos o plano em arquivo:
-      # o apply recebe as mesmas variáveis por TF_VAR_* e aplicar um plano salvo
-      # proíbe re-setar variáveis (erro "Can't change variable when applying a
-      # saved plan"). Por isso o apply roda direto, resolvendo as variáveis de novo.
+      # plan e apply leem o mesmo deploy.auto.tfvars.json (sem TF_VAR_*, sem plano
+      # salvo), então não há "Can't change variable when applying a saved plan".
       - name: Terraform Plan (log)
         run: terraform plan -input=false -no-color
 
