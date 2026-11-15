@@ -140,10 +140,17 @@ terraform output -json service_jdbc_urls   # { "os_service": "...", "billing": "
 ### Credenciais
 
 Cada instância tem **usuário e senha próprios**, definidos em `services[*].db_username`
-e `service_passwords[*]`. O usuário não pode ser `postgres`/`admin`/`root`/`rdsadmin`
-(reservados pelo RDS). No CI, as senhas vêm dos secrets `DB_PASSWORD_OS`,
-`DB_PASSWORD_BILLING` e `DB_PASSWORD_CUSTOMER` (e, opcionalmente, `DB_USERNAME_*`); são
-injetadas via `TF_VAR_service_passwords` e nunca gravadas em arquivo. Como são
+e `service_passwords[*]`. Regras do usuário (validadas já no `plan`): começa com letra, só
+letras/números/`_` (**sem hífen**), até 63 caracteres, e não pode ser
+`postgres`/`admin`/`root`/`rdsadmin` (reservados pelo RDS). **Não** use o nome da instância
+(`workshop-billing-main`) como usuário — o hífen faz o RDS falhar com
+`Invalid master user name`.
+
+No CI, as senhas vêm dos secrets `DB_PASSWORD_OS`, `DB_PASSWORD_BILLING` e
+`DB_PASSWORD_CUSTOMER`, e os usuários de `DB_USERNAME_*` (default `os_service`/`billing`/
+`customer`). A pipeline grava todas as variáveis num `deploy.auto.tfvars.json` gerado no
+próprio job (lido igual por `plan` e `apply`, nunca versionado) — **não** usa `TF_VAR_*`,
+que causava o erro *"Can't change variable when applying a saved plan"*. Como são
 instâncias separadas, a credencial de um serviço **não dá acesso** ao banco de outro.
 
 ## Ordem de deploy (infra)
